@@ -966,7 +966,11 @@ fn walk_shrink_residuals<P: RowProvider>(p: &mut P, emit: &mut dyn FnMut(u32)) -
         let pcs: &<InnerSC as StarkGenericConfig>::Pcs = config.pcs();
 
         // Build the main-trace list in the same deterministic order as the exporter: sort by chip name.
-        let mut trace_names: Vec<String> = machine.chips().map(|c| c.name().to_string()).collect();
+        let mut trace_names: Vec<String> = machine
+            .chips()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
         trace_names.sort();
 
         let mut domains_and_traces: Vec<(sp1_stark::Dom<InnerSC>, RowMajorMatrix<sp1_stark::Val<InnerSC>>)> =
