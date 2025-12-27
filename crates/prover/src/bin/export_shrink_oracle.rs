@@ -149,13 +149,14 @@ fn main() -> Result<()> {
     let public_values = runtime.record.public_values::<sp1_stark::Val<InnerSC>>();
     let mut challenger = config.challenger();
     let pv_slice = &public_values[0..machine.num_pv_elts()];
+    let pv_u32: Vec<u32> = pv_slice.iter().map(|f| f.as_canonical_u32()).collect();
     // Export the observed public values so downstream PVRS/tag code can re-derive the same
     // Fiat–Shamir challenges (perm_challenges) and bind the LogUp/memory checks to the transcript.
     metas.push(pvor::TableMeta {
         name: "public_values",
         rows: 1,
-        cols: pv_slice.len() as u32,
-        values_u32_le: Box::new(pv_slice.iter().map(|f| f.as_canonical_u32())),
+        cols: pv_u32.len() as u32,
+        values_u32_le: Box::new(pv_u32.into_iter()),
     });
     challenger.observe_slice(pv_slice);
     challenger.observe(main_commit);
