@@ -19,7 +19,7 @@ use sp1_core_machine::operations::poseidon2::{
 use sp1_primitives::RC_16_30_U32;
 
 use crate::{components::CpuProverComponents, InnerSC, SP1Prover};
-use sp1_stark::{populate_local_permutation_row, MachineProver};
+use sp1_stark::MachineProver;
 use sp1_stark::StarkGenericConfig;
 
 /// Abstraction over where tables come from (in-memory traces vs PVOR on disk).
@@ -934,9 +934,10 @@ fn walk_shrink_residuals<P: RowProvider>(p: &mut P, emit: &mut dyn FnMut(u32)) -
     // those permutation traces (exported in PVOR as `perm_challenges`).
     //
     // Concretely, for each included chip with local interactions:
-    // - recompute the expected local permutation row entries via `populate_local_permutation_row`
-    // - compare them to the exported `perm/<ChipName>` table
-    // - verify the cumulative sum (last column) matches the running sum of row entries
+    // - validate the exported `perm/<ChipName>` entries by enforcing the *same AIR constraints*
+    //   as `sp1_stark::eval_permutation_constraints` (product*entry == numerator), which avoids
+    //   any division semantics and is robust to denom==0 corner cases.
+    // - verify the cumulative sum (last column) matches the running sum of row entries.
     {
         dbg_section.set("Permutation");
         if debug_first_nonzero {
@@ -1029,10 +1030,20 @@ fn walk_shrink_residuals<P: RowProvider>(p: &mut P, emit: &mut dyn FnMut(u32)) -
                 continue;
             };
 
-            // Skip chips with no local interactions.
+            // Skip chips with no local interactions (permutation trace width == 0).
             if chip.permutation_width() == 0 {
                 continue;
             }
+
+            // This PVRS checker currently enforces the *local-scope* permutation constraints.
+            // If a chip uses global-scope interactions, we must also enforce the 14 "global sum"
+            // last-row constraints in `eval_permutation_constraints`.
+            //
+            // Fail loudly rather than silently under-checking.
+            anyhow::ensure!(
+                chip.commit_scope() == sp1_stark::air::InteractionScope::Local,
+                "chip {chip_name} has commit_scope=Global; PVRS permutation checker must be extended to enforce global-scope constraints"
+            );
 
             let perm_table = format!("perm/{chip_name}");
             let meta_table = format!("perm_meta/{chip_name}");
@@ -1073,15 +1084,23 @@ fn walk_shrink_residuals<P: RowProvider>(p: &mut P, emit: &mut dyn FnMut(u32)) -
                 anyhow::ensure!(prows == rows, "{pre_table}.rows ({prows}) != {chip_name}.rows ({rows})");
             }
 
-            let mut expected_entries = vec![BBExt::zero(); entry_cols];
+            // Only local-scope interactions contribute to the local permutation trace.
+            let (scoped_sends, scoped_receives) = sp1_stark::scoped_interactions(chip.sends(), chip.receives());
+            let local_sends = scoped_sends
+                .get(&sp1_stark::air::InteractionScope::Local)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let local_receives = scoped_receives
+                .get(&sp1_stark::air::InteractionScope::Local)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+
             let mut running_sum = BBExt::zero();
 
             for row in 0..rows {
                 if debug_first_nonzero {
                     dbg_row.set(row);
                 }
-
-                expected_entries.fill(BBExt::zero());
 
                 let main_u32 = p.read_row_u32(&chip_name, row)?;
                 let main_f: Vec<BabyBear> = main_u32.into_iter().map(bb_from_u32).collect();
@@ -1092,16 +1111,6 @@ fn walk_shrink_residuals<P: RowProvider>(p: &mut P, emit: &mut dyn FnMut(u32)) -
                     Vec::new()
                 };
 
-                populate_local_permutation_row::<BabyBear, BBExt>(
-                    &mut expected_entries,
-                    pre_f.as_slice(),
-                    main_f.as_slice(),
-                    chip.sends(),
-                    chip.receives(),
-                    &random_elements,
-                    batch_size,
-                );
-
                 let perm_u32 = p.read_row_u32(&perm_table, row)?;
                 anyhow::ensure!(
                     perm_u32.len() == perm_width * 4,
@@ -1110,20 +1119,93 @@ fn walk_shrink_residuals<P: RowProvider>(p: &mut P, emit: &mut dyn FnMut(u32)) -
                     perm_u32.len()
                 );
 
-                // Check entry columns.
-                for j in 0..entry_cols {
-                    let got = ext_from_block_u32([
-                        perm_u32[4 * j],
-                        perm_u32[4 * j + 1],
-                        perm_u32[4 * j + 2],
-                        perm_u32[4 * j + 3],
+                // Enforce AIR-style per-entry constraints:
+                // entry * Π rlc_i == Σ m_i * Π_{j!=i} rlc_j (over a batch chunk).
+                //
+                // This matches `sp1_stark::eval_permutation_constraints` and avoids any inversion.
+                let alpha = random_elements[0];
+                let beta = random_elements[1];
+
+                let total = local_sends.len() + local_receives.len();
+                anyhow::ensure!(
+                    entry_cols == total.div_ceil(batch_size),
+                    "{perm_table}.entry_cols ({entry_cols}) != ceil(num_local_interactions ({total}) / batch_size ({batch_size}))"
+                );
+
+                // We'll also accumulate the per-row sum of entries for cumulative-sum checking.
+                let mut row_sum = BBExt::zero();
+                for entry_idx in 0..entry_cols {
+                    // Slice the interactions for this batch.
+                    let start = entry_idx * batch_size;
+                    let end = core::cmp::min(start + batch_size, total);
+
+                    // Compute rlcs and multiplicities (with send/receive sign).
+                    let mut rlcs: Vec<BBExt> = Vec::with_capacity(end - start);
+                    let mut mults: Vec<BabyBear> = Vec::with_capacity(end - start);
+
+                    // Flatten sends then receives, matching `eval_permutation_constraints`.
+                    for flat_i in start..end {
+                        let (interaction, is_send) = if flat_i < local_sends.len() {
+                            (&local_sends[flat_i], true)
+                        } else {
+                            (&local_receives[flat_i - local_sends.len()], false)
+                        };
+
+                        let mut rlc = alpha;
+                        let mut betas = beta.powers();
+
+                        // β^0 * argument_index
+                        let beta0 = betas
+                            .next()
+                            .expect("beta.powers() must yield at least one element");
+                        rlc += beta0 * BBExt::from_canonical_usize(interaction.argument_index());
+
+                        // Σ β^j * value_j
+                        for (columns, bj) in interaction.values.iter().zip(betas) {
+                            let v: BabyBear = columns.apply::<BabyBear, BabyBear>(pre_f.as_slice(), main_f.as_slice());
+                            rlc += bj * BBExt::from_base(v);
+                        }
+                        rlcs.push(rlc);
+
+                        let mut m: BabyBear =
+                            interaction.multiplicity.apply::<BabyBear, BabyBear>(pre_f.as_slice(), main_f.as_slice());
+                        if !is_send {
+                            m = -m;
+                        }
+                        mults.push(m);
+                    }
+
+                    // Compute product and numerator.
+                    let mut product = BBExt::one();
+                    for rlc in rlcs.iter() {
+                        product *= *rlc;
+                    }
+                    let mut numerator = BBExt::zero();
+                    for (i, &m) in mults.iter().enumerate() {
+                        // Π_{j!=i} rlc_j
+                        let mut all_but_i = BBExt::one();
+                        for (j, rlc) in rlcs.iter().enumerate() {
+                            if j != i {
+                                all_but_i *= *rlc;
+                            }
+                        }
+                        numerator += BBExt::from_base(m) * all_but_i;
+                    }
+
+                    // Load the exported entry.
+                    let entry = ext_from_block_u32([
+                        perm_u32[4 * entry_idx],
+                        perm_u32[4 * entry_idx + 1],
+                        perm_u32[4 * entry_idx + 2],
+                        perm_u32[4 * entry_idx + 3],
                     ]);
-                    let ok = ext_eq(&got, &expected_entries[j]);
+
+                    let ok = ext_eq(&(product * entry), &numerator);
                     emit(if ok { 0 } else { 1 });
+                    row_sum += entry;
                 }
 
                 // Check running sum column.
-                let row_sum = expected_entries.iter().copied().fold(BBExt::zero(), |a, b| a + b);
                 running_sum = running_sum + row_sum;
                 let got_cum = ext_from_block_u32([
                     perm_u32[4 * entry_cols],
