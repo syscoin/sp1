@@ -14,7 +14,9 @@
 pub mod build;
 pub mod components;
 pub mod gas;
+pub mod pvor;
 pub mod shapes;
+pub mod shrink_tag;
 pub mod types;
 pub mod utils;
 pub mod verify;
