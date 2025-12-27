@@ -3,9 +3,12 @@ use std::io::{Seek, SeekFrom, Write};
 
 use anyhow::{anyhow, Context, Result};
 use p3_baby_bear::BabyBear;
+use p3_challenger::{CanObserve, FieldChallenger};
+use p3_commit::Pcs;
 use p3_field::extension::BinomialExtensionField;
 use p3_field::{AbstractExtensionField, AbstractField, PrimeField32};
 use p3_matrix::Matrix;
+use p3_matrix::dense::RowMajorMatrix;
 use sha2::{Digest, Sha256};
 use sp1_stark::air::MachineAir;
 use sp1_core_machine::operations::poseidon2::{
@@ -15,8 +18,9 @@ use sp1_core_machine::operations::poseidon2::{
 };
 use sp1_primitives::RC_16_30_U32;
 
-use crate::{components::CpuProverComponents, SP1Prover};
+use crate::{components::CpuProverComponents, InnerSC, SP1Prover};
 use sp1_stark::{populate_local_permutation_row, MachineProver};
+use sp1_stark::StarkGenericConfig;
 
 /// Abstraction over where tables come from (in-memory traces vs PVOR on disk).
 pub trait RowProvider {
@@ -939,6 +943,64 @@ fn walk_shrink_residuals<P: RowProvider>(p: &mut P, emit: &mut dyn FnMut(u32)) -
             eprintln!("debug: section={} start_idx={}", dbg_section.get(), dbg_idx.get());
         }
 
+        // `public_values` encodes the exact slice observed by the challenger before sampling
+        // `perm_challenges` in the exporter.
+        let (pv_rows, pv_cols) = p
+            .dims("public_values")
+            .ok_or_else(|| anyhow!("missing table 'public_values' (re-export PVOR with updated exporter)"))?;
+        anyhow::ensure!(pv_rows == 1, "public_values.rows expected 1, got {pv_rows}");
+        let pv_u32 = p.read_row_u32("public_values", 0)?;
+        anyhow::ensure!(
+            pv_u32.len() == pv_cols as usize,
+            "public_values row len mismatch"
+        );
+        let public_values: Vec<BabyBear> = pv_u32.into_iter().map(bb_from_u32).collect();
+
+        // Re-derive the permutation challenges (alpha,beta) from the transcript:
+        // challenger.observe_slice(public_values[0..num_pv_elts]); challenger.observe(main_commit);
+        //
+        // This binds the LogUp/permutation/memory checks to the same Fiat–Shamir challenges SP1 uses.
+        let prover: SP1Prover<CpuProverComponents> = SP1Prover::uninitialized();
+        let machine = prover.shrink_prover.machine();
+        let config = machine.config();
+        let pcs: &<InnerSC as StarkGenericConfig>::Pcs = config.pcs();
+
+        // Build the main-trace list in the same deterministic order as the exporter: sort by chip name.
+        let mut trace_names: Vec<String> = machine.chips().map(|c| c.name().to_string()).collect();
+        trace_names.sort();
+
+        let mut domains_and_traces: Vec<(sp1_stark::Dom<InnerSC>, RowMajorMatrix<sp1_stark::Val<InnerSC>>)> =
+            Vec::with_capacity(trace_names.len());
+        for name in trace_names.iter() {
+            let (rows, cols) = p.dims(name).ok_or_else(|| anyhow!("missing table '{name}'"))?;
+            let mut vals: Vec<sp1_stark::Val<InnerSC>> = Vec::with_capacity((rows as usize) * (cols as usize));
+            for r in 0..rows {
+                let row_u32 = p.read_row_u32(name, r)?;
+                anyhow::ensure!(row_u32.len() == cols as usize, "row len mismatch for table '{name}'");
+                for x in row_u32 {
+                    vals.push(bb_from_u32(x));
+                }
+            }
+            let mat = RowMajorMatrix::new(vals, cols as usize);
+            let domain = <<InnerSC as StarkGenericConfig>::Pcs as Pcs<
+                sp1_stark::Challenge<InnerSC>,
+                sp1_stark::Challenger<InnerSC>,
+            >>::natural_domain_for_degree(pcs, mat.height());
+            domains_and_traces.push((domain, mat));
+        }
+
+        let (main_commit, _main_data): (sp1_stark::Com<InnerSC>, sp1_stark::PcsProverData<InnerSC>) =
+            <<InnerSC as StarkGenericConfig>::Pcs as Pcs<
+                sp1_stark::Challenge<InnerSC>,
+                sp1_stark::Challenger<InnerSC>,
+            >>::commit(pcs, domains_and_traces);
+
+        let mut challenger = config.challenger();
+        challenger.observe_slice(&public_values[0..machine.num_pv_elts()]);
+        challenger.observe(main_commit);
+        let perm_alpha: sp1_stark::Challenge<InnerSC> = challenger.sample_ext_element();
+        let perm_beta: sp1_stark::Challenge<InnerSC> = challenger.sample_ext_element();
+
         // `perm_challenges` encodes [alpha (4 limbs), beta (4 limbs)] as BabyBear base limbs.
         let chal = p
             .dims("perm_challenges")
@@ -948,11 +1010,12 @@ fn walk_shrink_residuals<P: RowProvider>(p: &mut P, emit: &mut dyn FnMut(u32)) -
         let chal_row = p.read_row_u32("perm_challenges", 0)?;
         let alpha = ext_from_block_u32([chal_row[0], chal_row[1], chal_row[2], chal_row[3]]);
         let beta = ext_from_block_u32([chal_row[4], chal_row[5], chal_row[6], chal_row[7]]);
-        let random_elements = [alpha, beta];
+        // Enforce transcript binding: exported perm_challenges must match re-derived challenges.
+        emit(if ext_eq(&alpha, &perm_alpha) { 0 } else { 1 });
+        emit(if ext_eq(&beta, &perm_beta) { 0 } else { 1 });
 
-        // Build the shrink machine (to access per-chip interaction formulas).
-        let prover: SP1Prover<CpuProverComponents> = SP1Prover::uninitialized();
-        let machine = prover.shrink_prover.machine();
+        // Use the re-derived challenges for the LogUp checks.
+        let random_elements = [perm_alpha, perm_beta];
 
         for chip in machine.chips() {
             let chip_name = chip.name();
